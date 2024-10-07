@@ -9,6 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
+from typing import Literal
 from dataclasses import dataclass
 
 import torch
@@ -31,6 +32,7 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        self.use_rope = config.positional_encoding == "rope"
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
@@ -41,6 +43,8 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        if self.use_rope:
+            self.rope = RotaryPositionalEmbedding(d_model=config.n_embd, max_seq_len=config.block_size)
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -54,6 +58,11 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        if self.use_rope:
+            # apply rope to q and k to last 2 dimensions
+            # q shape batch size, sequence length, hidden size
+            q = self.rope(q)
+            k = self.rope(k)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -105,6 +114,63 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+# ref: https://medium.com/ai-insights-cobet/rotary-positional-embeddings-a-detailed-look-and-comprehensive-understanding-4ff66a874d83
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, d_model, max_seq_len):
+        super(RotaryPositionalEmbedding, self).__init__()
+
+        # Create a rotation matrix.
+        rotation_matrix = torch.zeros(d_model, d_model)
+        for i in range(d_model):
+            for j in range(d_model):
+                rotation_matrix[i, j] = torch.cos(torch.Tensor([i * j * 0.01]))
+
+        # Create a positional embedding matrix.
+        positional_embedding = torch.zeros(max_seq_len, d_model)
+        for i in range(max_seq_len):
+            for j in range(d_model):
+                positional_embedding[i, j] = torch.cos(torch.Tensor([i * j * 0.01]))
+        self.register_buffer("rotation_matrix", rotation_matrix)
+        self.register_buffer("positional_embedding", positional_embedding)
+
+    def forward(self, x):
+        """
+        Args:
+            x: A tensor of shape (batch_size, seq_len, d_model).
+
+        Returns:
+            A tensor of shape (batch_size, seq_len, d_model).
+        """
+
+        # Add the positional embedding to the input tensor.
+        x = x + self.positional_embedding
+
+        # Apply the rotation matrix to the input tensor.
+        x = torch.matmul(x, self.rotation_matrix)
+
+        return x
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, max_sequence_length, d_model):
+        super().__init__()
+        positional_encoding = torch.zeros(max_sequence_length, d_model)
+        # every position attends to each dimension
+        positions = torch.arange(0, max_sequence_length).unsqueeze(1)
+
+        dimensions = torch.arange(0, d_model, 2)
+        division_term = 1. / (10000 ** (dimensions/d_model))
+
+        # even indices
+        positional_encoding[:, 0::2] = torch.sin(positions * division_term)
+        # odd indices
+        positional_encoding[:, 1::2] = torch.cos(positions * division_term)
+        self.register_buffer("positional_encoding", positional_encoding.unsqueeze(0))
+
+    def forward(self, X):
+        # embeddings usually will have following dimensions - (batch_size, sequence_length, d_model)
+        # we must add positional encoding to the size of X.shape[1]
+        return X + self.positional_encoding[:, :X.shape[1], :]
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -114,6 +180,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    positional_encoding : Literal['learnable', 'sinusoidal', 'rope'] = 'rope'
 
 class GPT(nn.Module):
 
@@ -125,11 +192,14 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        if self.config.positional_encoding == "learnable":
+            self.transformer["pe"] = nn.Embedding(config.block_size, config.n_embd)
+        elif self.config.positional_encoding == "sinusoidal":
+            self.transformer["pe"] = PositionalEncoding(max_sequence_length=config.block_size, d_model=config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -155,8 +225,8 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+        if non_embedding and self.config.positional_encoding == "learnable":
+            n_params -= self.transformer.pe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -171,12 +241,16 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        if self.config.positional_encoding == 'learnable':
+                pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+                pos_emb = self.transformer.pe(pos) # position embeddings of shape (t, n_embd)
+                tok_emb = tok_emb + pos_emb
+        elif self.config.positional_encoding == "sinusoidal":
+                tok_emb = self.transformer.pe(tok_emb)
+        x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -198,7 +272,8 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        if self.config.positional_encoding == 'learnable':
+            self.transformer.pe.weight = nn.Parameter(self.transformer.pe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
