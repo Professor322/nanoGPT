@@ -2,8 +2,8 @@
 # good for debugging and playing on macbooks and such
 
 out_dir = 'out-shakespeare-rope'
-eval_interval = 250 # keep frequent because we'll overfit
-eval_iters = 200
+eval_interval = 150 # keep frequent because we'll overfit
+eval_iters = 150
 log_interval = 10 # don't print too too often
 
 # we expect to overfit on this small dataset, so only save when val improves
