@@ -32,6 +32,9 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
+val_loss = []
+train_loss = []
+perplexities = []
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
@@ -54,6 +57,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+positional_encoding = "learnable"
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -145,7 +149,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, positional_encoding=positional_encoding) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -264,6 +268,9 @@ while True:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f} "
               f"val perplexity {torch.exp(losses['val']):.4f}")
+        val_loss.append(losses['val'].item())
+        train_loss.append(losses['train'].item())
+        perplexities.append(torch.exp(losses['val']).item())
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -282,6 +289,9 @@ while True:
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
+                    'val_losses': val_loss,
+                    'train_losses': train_loss,
+                    'perplexities': perplexities
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))

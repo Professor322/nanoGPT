@@ -143,7 +143,8 @@ class RotaryPositionalEmbedding(nn.Module):
         """
 
         # Add the positional embedding to the input tensor.
-        x = x + self.positional_embedding
+        _, seq_len, _ = x.shape
+        x = x + self.positional_embedding[:seq_len, :]
 
         # Apply the rotation matrix to the input tensor.
         x = torch.matmul(x, self.rotation_matrix)
@@ -245,11 +246,11 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         if self.config.positional_encoding == 'learnable':
-                pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-                pos_emb = self.transformer.pe(pos) # position embeddings of shape (t, n_embd)
-                tok_emb = tok_emb + pos_emb
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+            pos_emb = self.transformer.pe(pos) # position embeddings of shape (t, n_embd)
+            tok_emb = tok_emb + pos_emb
         elif self.config.positional_encoding == "sinusoidal":
-                tok_emb = self.transformer.pe(tok_emb)
+            tok_emb = self.transformer.pe(tok_emb)
         x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
             x = block(x)
